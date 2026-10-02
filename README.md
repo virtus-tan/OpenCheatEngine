@@ -1,4 +1,4 @@
-# CE Testing bridge
+# CE bridge
 
 A process-memory bridge for Windows with a link to Cheat Engine, and 43 opencode
 tools that let an AI drive it. Built for learning reverse engineering on games
