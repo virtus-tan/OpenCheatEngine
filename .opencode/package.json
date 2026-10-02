@@ -1,0 +1,9 @@
+{
+  "name": "ce-testing-bridge-opencode",
+  "private": true,
+  "type": "module",
+  "description": "opencode tools for the CE Testing bridge",
+  "dependencies": {
+    "@opencode-ai/plugin": "latest"
+  }
+}

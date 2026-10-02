@@ -1,0 +1,34 @@
+# local machine config (contains paths and the auth token)
+config.json
+
+# runtime output
+bridge.log
+lab/*.log
+lab/lab_truth.txt
+lab/ce_truth.txt
+lab/celink_truth.txt
+lab/celink.log
+lab/cetest.log
+lab/arch_*.txt
+lab/probe*.txt
+lab/obj64/
+lab/obj32/
+lab/*.obj
+lab/*.pdb
+lab/*.ilk
+
+# built by lab\build_lab.bat
+lab/lab_target.exe
+lab/lab_target32.exe
+
+# installed by opencode at startup
+.opencode/node_modules/
+.opencode/package-lock.json
+.opencode/bun.lock
+
+# per-run spools in the temp directory
+%TEMP%/ce_spool_*/
+
+# python
+__pycache__/
+*.pyc

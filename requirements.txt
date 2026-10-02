@@ -1,0 +1,16 @@
+# CE Testing bridge - Python side.
+#
+#   python -m pip install -r requirements.txt
+#
+# capstone and keystone-engine are what make disassembly and assembly work.
+# dnfile is what turns Assembly-CSharp.dll into a readable list of classes and
+# fields, which is how a Unity game stops being a guessing game.
+
+capstone>=5.0
+keystone-engine>=0.9.2
+psutil>=5.9
+dnfile>=0.13
+
+# Only needed by tests/luatest.py, which runs the Cheat Engine agent's Lua in a
+# real interpreter against a mock of CE 7.4's API.
+lupa>=2.0
