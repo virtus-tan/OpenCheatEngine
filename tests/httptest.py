@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -16,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ce_bridge.bridge import TOOLS, Bridge
 from ce_bridge.config import Config
+from ce_bridge.events import KEEPALIVE, frame
 from ce_bridge.server import BridgeServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -64,6 +66,89 @@ class Client:
                 return response.status, json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
             return error.code, json.loads(error.read().decode("utf-8"))
+
+
+class Stream:
+    """One client holding GET /api/events open, collecting frames as they land.
+
+    Read one byte at a time on purpose: urllib will happily stream a response
+    with no Content-Length, and reading in small pieces is what proves the
+    bridge writes each event as it happens instead of buffering until the end.
+    """
+
+    def __init__(self, base, token=None, query_token=False):
+        self.base = base
+        self.token = token
+        self.frames = []
+        self.comments = 0
+        self.error = None
+        self.status = None
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        url = f"{base}/api/events"
+        if query_token:
+            url += f"?token={token}"
+        headers = {} if token is None else {"X-CE-Bridge-Token": token}
+        request = urllib.request.Request(url, headers=headers)
+        self._thread = threading.Thread(target=self._read, args=(request,), daemon=True)
+        self._thread.start()
+
+    def _read(self, request):
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                self.status = response.status
+                buffer = b""
+                while not self._stop.is_set():
+                    chunk = response.read(1)
+                    if not chunk:
+                        break
+                    buffer += chunk
+                    while b"\n\n" in buffer:
+                        raw, buffer = buffer.split(b"\n\n", 1)
+                        self._absorb(raw.decode("utf-8", "replace"))
+        except urllib.error.HTTPError as error:
+            self.status = error.code
+            self.error = error.read().decode("utf-8", "replace")
+        except Exception as error:
+            self.error = str(error)
+
+    def _absorb(self, raw):
+        kind = "message"
+        data = []
+        for line in raw.split("\n"):
+            if line.startswith(":"):
+                with self._lock:
+                    self.comments += 1
+                continue
+            if line.startswith("event:"):
+                kind = line[6:].strip()
+            elif line.startswith("data:"):
+                data.append(line[5:].strip())
+        if not data:
+            return
+        try:
+            payload = json.loads("\n".join(data))
+        except ValueError:
+            return
+        with self._lock:
+            self.frames.append({"event": kind, "data": payload})
+
+    def kinds(self):
+        with self._lock:
+            return [item["event"] for item in self.frames]
+
+    def wait_for(self, kind, timeout=8.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._lock:
+                for item in self.frames:
+                    if item["event"] == kind:
+                        return item
+            time.sleep(0.05)
+        return None
+
+    def close(self):
+        self._stop.set()
 
 
 def launch_lab():
@@ -288,6 +373,84 @@ def run(client, truth, lab):
     check("the event log records the cycle",
           any(item["event"] == "attached" for item in body["result"]["events"]),
           str(body["result"]["events"])[:200])
+
+    run_events(client)
+
+
+def run_events(client):
+    """The push side: one open connection, and every state change arrives on it.
+
+    This is what the opencode plugin holds. Without it the only way to learn
+    the target changed was to call a tool and hope the AI did.
+    """
+    print("\nevent stream")
+
+    check("a frame carries a newline-free payload",
+          b"\n" not in frame("x", {"note": "a\nb"}).split(b"data: ", 1)[1][:-2])
+    check("a keepalive is a comment, not a frame",
+          KEEPALIVE.startswith(b":") and KEEPALIVE.endswith(b"\n\n"))
+
+    unauth = Stream(client.base)
+    time.sleep(0.4)
+    check("the stream needs a token like every other route", unauth.status == 401,
+          f"status={unauth.status} error={str(unauth.error)[:80]}")
+    unauth.close()
+
+    stream = Stream(client.base, client.token, query_token=True)
+    try:
+        hello = stream.wait_for("hello")
+        check("the stream opens on connect", hello is not None, str(stream.error)[:120])
+        if hello:
+            check("the opening frame is the full status",
+                  "target" in hello["data"] and "cheat_engine" in hello["data"],
+                  str(list(hello["data"]))[:120])
+        check("an idle stream sends no frames, only heartbeats",
+              stream.kinds() == ["hello"], str(stream.kinds()))
+
+        status, body = client.post("attach", {"name": "lab_target.exe"})
+        check("attach for the stream test", body["ok"], body.get("error", "")[:120])
+        attached = stream.wait_for("attached")
+        check("attaching pushes an event", attached is not None, str(stream.kinds()))
+        if attached:
+            check("the event names the pid that was attached",
+                  attached["data"]["target"]["pid"] == body["result"]["pid"],
+                  str(attached["data"]["target"])[:120])
+            check("the event says the target is read-only",
+                  attached["data"]["target"]["writable"] is False)
+
+        status, body = client.post("unlock", {"writable": True})
+        unlocked = stream.wait_for("unlocked")
+        check("unlocking pushes an event", unlocked is not None, str(stream.kinds()))
+        if unlocked:
+            check("the event carries the new writable state",
+                  unlocked["data"]["target"]["writable"] is True)
+
+        status, body = client.post("status", {})
+        check("status counts the connected client",
+              body["result"]["bridge"].get("subscribers", 0) >= 1,
+              str(body["result"]["bridge"]))
+
+        status, body = client.post("detach", {})
+        detached = stream.wait_for("detached")
+        check("detaching pushes an event", detached is not None, str(stream.kinds()))
+        if detached:
+            check("the event says no target is attached",
+                  detached["data"]["target"] is None)
+
+        # Two clients at once: the bus is a fan-out, not a single slot.
+        second = Stream(client.base, client.token)
+        try:
+            check("a second client is served too", second.wait_for("hello") is not None)
+            status, body = client.post("attach", {"name": "lab_target.exe"})
+            check("both clients see the same attach",
+                  second.wait_for("attached") is not None and
+                  stream.wait_for("attached") is not None)
+        finally:
+            second.close()
+            client.post("detach", {})
+    finally:
+        stream.close()
+        time.sleep(0.2)
 
 
 if __name__ == "__main__":

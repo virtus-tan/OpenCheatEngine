@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from . import config as config_module
 from .celink import CELink
 from .core import managed as managed_core
+from .events import EventBus
 from .session import BridgeError, NoTarget, ReadOnly, Target, list_processes
 
 def now():
@@ -75,10 +76,13 @@ class Bridge:
         )
         self.ce.on_attach = self._on_ce_attach
         self.ce.on_detach = self._on_ce_detach
+        self.ce.on_state = self._on_ce_state
+        self.events = EventBus()
 
     def start(self):
         self.ce.start()
         self.log.info("bridge ready on %s:%s", self.config.get("host"), self.config.get("port"))
+        self.events.publish("bridge_ready", self.status())
         return self
 
     def stop(self):
@@ -87,7 +91,30 @@ class Bridge:
                 self.target.close()
                 self.target = None
         self.ce.stop()
+        self.events.publish("bridge_stopped", self.status())
         self.log.info("bridge stopped")
+
+    def _state_payload(self):
+        """What a pushed event carries: who is attached, and whether CE answers.
+
+        Deliberately not the whole status payload. Every event goes to every
+        connected client, and the history and next_step text would be noise in
+        a stream that fires on every attach.
+        """
+        return {"target": self.target.status() if self.target else None,
+                "cheat_engine": self.ce.status()}
+
+    def _on_ce_state(self):
+        """The Cheat Engine agent's own view changed.
+
+        Fired from the spool poll thread. Only agent_seen, the pid and the
+        version are interesting; address_list_count ticks constantly while the
+        human is mirroring things and would turn this into a firehose.
+        """
+        self.events.publish("cheat_engine", self._state_payload())
+
+    def _publish(self, kind):
+        return self.events.publish(kind, self._state_payload())
 
     def _on_ce_attach(self, pid, name):
         with self.lock:
@@ -104,11 +131,17 @@ class Bridge:
                 self.log.error("could not attach to pid %s: %s", pid, error)
                 self.history.append({"at": now(), "event": "attach_failed", "pid": pid,
                                      "error": str(error)})
+                # The reason is in the event, not just the log: a client that
+                # only shows a toast has nowhere else to learn why nothing
+                # happened.
+                self.events.publish("attach_failed", dict(self._state_payload(),
+                                                          pid=pid, error=str(error)))
                 return
             self.history.append({"at": now(), "event": "attached", "pid": pid, "name": name,
                                  "source": "cheat-engine"})
         self.log.info("target acquired: %s pid %s (%s)", name, pid,
                       "x64" if self.target.proc.is_64bit else "x86")
+        self._publish("attached")
 
     def _on_ce_detach(self):
         with self.lock:
@@ -117,6 +150,7 @@ class Bridge:
                 self.history.append({"at": now(), "event": "detached", "pid": self.target.pid})
                 self.target.close()
                 self.target = None
+        self._publish("detached")
 
     def require_target(self):
         with self.lock:
@@ -126,6 +160,12 @@ class Bridge:
                 pid = self.target.pid
                 self.target.close()
                 self.target = None
+                # A game that exits looks exactly like a detach from in here,
+                # so it is announced the same way rather than left to the next
+                # tool call to fail.
+                self.history.append({"at": now(), "event": "detached", "pid": pid,
+                                     "reason": "process exited"})
+                self._publish("detached")
                 raise BridgeError(
                     f"the target process (pid {pid}) has exited. Reattach in Cheat Engine."
                 )
@@ -139,6 +179,7 @@ class Bridge:
                     "uptime_seconds": round(time.time() - _epoch(self.started_at), 1),
                     "host": self.config.get("host"),
                     "port": self.config.get("port"),
+                    "subscribers": self.events.count(),
                 },
                 "cheat_engine": self.ce.status(),
                 "target": self.target.status() if self.target else None,
@@ -166,6 +207,7 @@ class Bridge:
             self.target = Target(int(pid), writable=bool(writable), source="api")
             self.history.append({"at": now(), "event": "attached", "pid": int(pid),
                                  "source": "api"})
+        self._publish("attached")
         return self.target.status()
 
     def attach_by_name(self, name, writable=False):
@@ -190,10 +232,13 @@ class Bridge:
                 self.target.close()
                 self.target = None
             self.history.append({"at": now(), "event": "detached", "pid": pid})
+        self._publish("detached")
         return {"detached": pid is not None, "pid": pid}
 
     def unlock(self, writable=True):
-        return self.require_target().unlock(bool(writable))
+        status = self.require_target().unlock(bool(writable))
+        self._publish("unlocked")
+        return status
 
     def call(self, tool, params):
         handler = getattr(self, f"tool_{tool}", None)

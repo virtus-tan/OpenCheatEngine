@@ -91,6 +91,8 @@ class CELink:
         }
         self.on_attach = None
         self.on_detach = None
+        self.on_state = None
+        self._last_signature = None
 
     def ensure_dir(self):
         os.makedirs(self.dir, exist_ok=True)
@@ -147,9 +149,11 @@ class CELink:
 
     def _read_status(self):
         if not os.path.exists(self.status_path):
+            self._changed(False)
             return None
         if time.time() - os.path.getmtime(self.status_path) > STATUS_MAX_AGE:
             self.state["agent_seen"] = False
+            self._changed(False)
             return None
         report = self._read_json_file(self.status_path)
         if not report:
@@ -164,6 +168,7 @@ class CELink:
             "arch": report.get("arch") if current else None,
             "address_list_count": report.get("address_list_count") or 0,
         })
+        self._changed(current != previous)
         if current and current != previous:
             self.log.info("Cheat Engine attached to pid %s (%s)", current, report.get("name"))
             if self.on_attach:
@@ -173,6 +178,27 @@ class CELink:
             if self.on_detach:
                 self.on_detach()
         return report
+
+    # Only the fields a client would render. address_list_count changes every
+    # time something is mirrored into Cheat Engine's address list, which is
+    # often and means nothing, so it is excluded on purpose.
+    _WATCHED = ("agent_seen", "ce_version", "agent_version", "attached_pid", "arch")
+
+    def _changed(self, pid_changed=False):
+        """Tell the bridge when the agent's report differs from the last one.
+
+        on_attach and on_detach only cover the pid, which leaves the agent
+        appearing and disappearing - Cheat Engine closed, agent not installed -
+        invisible. That is the state a shell indicator most needs, so it is
+        watched here rather than inferred from a poll elsewhere.
+        """
+        if self.on_state is None:
+            return
+        signature = tuple(self.state.get(key) for key in self._WATCHED)
+        if signature == getattr(self, "_last_signature", None) and not pid_changed:
+            return
+        self._last_signature = signature
+        self.on_state()
 
     def describe_process(self, pid, reported_name=None):
         """Name and architecture for a pid, preferring what Cheat Engine said.
@@ -217,6 +243,7 @@ class CELink:
             "address_list_supported": bool(report.get("addresslist")),
             "ce_version": report.get("ce_version") or self.state.get("ce_version"),
         })
+        self._changed()
         return {
             "version": report.get("version"),
             "ce_version": report.get("ce_version"),

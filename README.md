@@ -109,8 +109,10 @@ them in `~/.config/opencode/` so they work in every project. See
 
 ```
 opencode tool  ->  HTTP  ->  bridge (127.0.0.1:9877, token)  ->  Win32
-                                            |
-                                            +-- spool in %TEMP%  ->  CE Lua agent
+       ^                                             |
+       |                                             +-- spool in %TEMP%  ->  CE Lua agent
+       |                                             |
+       +---------- SSE /api/events <-----------------+
 ```
 
 The Python side does the real memory work: `ReadProcessMemory`,
@@ -126,6 +128,48 @@ writes `cmd.txt`, the agent answers `res.txt`. `tests/fake_agent.py` implements
 the same protocol, so the Cheat Engine side can be developed and tested without
 the GUI or elevation.
 
+## Seeing the connection
+
+The tools are request/response, which means the shell has nothing to show
+between calls: attaching in Cheat Engine looked like it had done nothing until
+the AI happened to run a tool. So the plugin holds one connection open instead.
+
+`GET /api/events` is a server-sent event stream. A client opens it once and the
+bridge writes to it whenever its state changes — Cheat Engine's agent appears or
+disappears, a target is attached or released, `ce_unlock` changes a read-only
+target into a writable one. The first frame is the full status, so a client can
+render without a second round trip, and a comment every ten seconds keeps the
+connection provably alive through anything that would otherwise time it out.
+
+That is what the opencode plugin in `.opencode/plugins/ce-bridge.ts` does:
+
+```
+$ python bridge.py start        # in another terminal
+                                 # attach in Cheat Engine
+                                 # -> "Target attached" toast, no tool call involved
+```
+
+So in the shell:
+
+| You see | It means |
+|---|---|
+| `CE bridge not running` | nothing is listening on the port yet; it retries |
+| `CE bridge connected` | the stream is open; `status.bridge.subscribers` counts the clients |
+| `Cheat Engine agent connected` / `gone` | `hello.txt`/`status.txt` appearing or going stale |
+| `Target attached` / `released` | a pid arrived or went away |
+| `Target unlocked` / `locked` | `PROCESS_VM_WRITE` was requested or dropped |
+
+Every one of those also goes to the opencode log under the service name
+`ce-bridge`, which is the durable answer to "is this thing actually connected?"
+when a toast has scrolled away. Shell commands can read `CE_BRIDGE_STREAM`,
+which is `connected` or `disconnected`.
+
+The token can travel in the query string as well as the header, because
+`EventSource` cannot set headers. It is still required: the stream is on the same
+authenticated port as everything else, and an unauthenticated one would hand
+process control to anything that can open a socket.
+
+
 ## Verifying it
 
 The bridge is tested against a purpose-built lab target that prints the address
@@ -133,7 +177,7 @@ of every global it owns, so each assertion is a fact about the process rather
 than a guess.
 
 ```powershell
-python tests/run_all.py             # 351 tests
+python tests/run_all.py             # 387 tests
 python tests/run_all.py --with-ce   # plus the real Cheat Engine agent
 ```
 
@@ -141,10 +185,11 @@ python tests/run_all.py --with-ce   # plus the real Cheat Engine agent
 |---|---|---|
 | `selftest.py` | 93 | read/write/undo, scanning, disassembly, AOB, xrefs, freeze, watch, journal |
 | `archtest.py` | 40 | x64 and x86 against both lab builds, including real remote calls |
-| `httptest.py` | 62 | token, routing, every tool over HTTP |
+| `httptest.py` | 79 | token, routing, every tool over HTTP, and the event stream |
 | `celink_test.py` | 30 | spool protocol, attach handshake, mirroring, against a stand-in agent |
 | `luatest.py` | 32 | the agent's Lua, run in a real interpreter against CE 7.4's API surface |
 | `tools.test.ts` | 94 | all 43 opencode tools loaded and driven end to end |
+| `stream.test.ts` | 19 | the plugin's open connection: it learns of a state change with no tool call, loses the stream when the bridge dies, and reconnects when it comes back |
 | `cetest.py` | 25 | the real Cheat Engine agent; needs the UAC prompt |
 
 `luatest.py` is the interesting one. Cheat Engine 7.4's Lua turns out not to
@@ -199,7 +244,8 @@ bridge.py                  CLI: start, status, call, install-agent, tools
 config.json                port, Cheat Engine paths, token
 ce_bridge/
   bridge.py                state, and the tool surface the HTTP layer exposes
-  server.py                HTTP/JSON, token auth, endpoint publishing
+  server.py                HTTP/JSON, token auth, endpoint publishing, /api/events
+  events.py                the fan-out behind the event stream
   session.py               target lifecycle, read-only gate, undo journal
   celink.py                the Cheat Engine spool protocol and launcher
   config.py  logging
@@ -216,7 +262,7 @@ ce_bridge/
     inject.py              export resolution, patching, hooks
 .opencode/
   tools/                   43 tools, one file each
-  plugins/ce-bridge.ts     health checks, toasts, workflow hint in the shell
+  plugins/ce-bridge.ts     the live link: toasts, logs, the workflow hint
   lib/bridge-client.ts     the shared HTTP client
 lab/                       the lab target and its build script
 tests/                     the suites above, plus fake_agent.py

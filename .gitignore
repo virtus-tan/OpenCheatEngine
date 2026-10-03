@@ -11,6 +11,8 @@ lab/celink.log
 lab/cetest.log
 lab/arch_*.txt
 lab/probe*.txt
+# what each suite's lab target printed, one file per suite
+lab/*_truth.txt
 lab/obj64/
 lab/obj32/
 lab/*.obj
